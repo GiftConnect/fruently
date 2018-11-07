@@ -3,6 +3,10 @@
 use std::borrow::{Borrow, Cow};
 use std::net::ToSocketAddrs;
 use std::net;
+use std::sync::{
+    Mutex,
+    Arc,
+};
 use std::io::Write;
 use record::Record;
 #[cfg(not(feature = "time-as-integer"))]
@@ -14,12 +18,13 @@ use serde_json;
 use rmp_serde::encode::Serializer;
 use error::FluentError;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Fluent<'a, A>
 where
     A: ToSocketAddrs,
 {
     addr: A,
+    conn: Option<Arc<Mutex<net::TcpStream>>>,
     tag: Cow<'a, str>,
     conf: RetryConf,
 }
@@ -39,23 +44,30 @@ impl<'a, A: ToSocketAddrs> Fluent<'a, A> {
     /// let fruently_with_str_tag = Fluent::new("127.0.0.1:24224", "test");
     /// let fruently_with_string_tag = Fluent::new("127.0.0.1:24224", "test".to_string());
     /// ```
-    pub fn new<T>(addr: A, tag: T) -> Fluent<'a, A>
+    pub fn new<T>(addr: A, tag: T, conn: Option<Arc<Mutex<net::TcpStream>>>) -> Fluent<'a, A>
     where
         T: Into<Cow<'a, str>>,
     {
+        //let mut stream = net::TcpStream::connect(addr)?;
         Fluent {
             addr,
+            conn,
             tag: tag.into(),
             conf: RetryConf::new(),
         }
     }
 
-    pub fn new_with_conf<T>(addr: A, tag: T, conf: RetryConf) -> Fluent<'a, A>
+    pub fn new_with_conf<T>(addr: A, tag: T, conf: RetryConf, conn: Option<Arc<Mutex<net::TcpStream>>>) -> Fluent<'a, A>
     where
         T: Into<Cow<'a, str>>,
     {
+        let stream = net::TcpStream::connect(addr.borrow()).ok()
+            .map(|stream| {
+                Arc::new(Mutex::new(stream))
+            });
         Fluent {
             addr,
+            conn: stream,
             tag: tag.into(),
             conf,
         }
@@ -76,18 +88,44 @@ impl<'a, A: ToSocketAddrs> Fluent<'a, A> {
         Cow::Borrowed(&self.conf)
     }
 
+    pub fn get_conn(&self) -> Option<Arc<Mutex<net::TcpStream>>> {
+        self.conn.clone()
+    }
+
     #[doc(hidden)]
     /// For internal usage.
-    pub fn closure_send_as_json<T: Serialize>(addr: &A, record: &Record<T>) -> Result<(), FluentError> {
-        let mut stream = net::TcpStream::connect(addr)?;
-        let message = serde_json::to_string(&record)?;
+    pub fn closure_send_as_json<T: Serialize>(addr: &A, record: &Record<T>, conn: Option<Arc<Mutex<net::TcpStream>>>) -> Result<(), FluentError> {
+
+        if let Some(conn_mutex) = conn {
+            let mut stream = conn_mutex.lock().unwrap();
+            let message = serde_json::to_string(&record)?;
+            let result = stream.write(&message.into_bytes());
+            drop(stream);
+
+            match result {
+                Ok(_) => Ok(()),
+                Err(v) => Err(From::from(v)),
+            }
+        } else {
+            let mut stream = net::TcpStream::connect(addr)?;
+            let message = serde_json::to_string(&record)?;
+            let result = stream.write(&message.into_bytes());
+            drop(stream);
+
+            match result {
+                Ok(_) => Ok(()),
+                Err(v) => Err(From::from(v)),
+            }
+        }
+        //let mut stream = net::TcpStream::connect(addr)?;
+        /*let message = serde_json::to_string(&record)?;
         let result = stream.write(&message.into_bytes());
         drop(stream);
 
         match result {
             Ok(_) => Ok(()),
             Err(v) => Err(From::from(v)),
-        }
+        }*/
     }
 
     #[doc(hidden)]
@@ -125,6 +163,7 @@ mod tests {
     fn create_fruently() {
         let fruently = Fluent::new("127.0.0.1:24224", "test");
         let expected = Fluent {
+            conn: None,
             addr: "127.0.0.1:24224",
             tag: Cow::Borrowed("test"),
             conf: RetryConf::new(),
